@@ -42,17 +42,29 @@ def tmux(socket, *args):
     return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True)
 
 
+CONTENT_OPTIONS = {
+    "status": "-gv", "status-interval": "-gv", "status-justify": "-gv", "status-position": "-gv",
+    "status-left": "-gv", "status-right": "-gv", "status-left-length": "-gv", "status-right-length": "-gv",
+    "window-status-format": "-gwv", "window-status-current-format": "-gwv", "window-status-separator": "-gwv",
+    "pane-border-format": "-gwv", "pane-border-status": "-gwv",
+}
+
+
+def content(socket):
+    return {name: tmux(socket, "show-options", flags, name).stdout for name, flags in CONTENT_OPTIONS.items()}
+
+
 def options_after(*load):
     socket = f"deepwick-test-{os.getpid()}-{next(_ids)}"
     try:
         assert tmux(socket, "-f", "/dev/null", "new-session", "-d").returncode == 0
-        defaults = {name: tmux(socket, "show-options", "-gv", "status-left").stdout for name in ["status-left"]}
+        defaults = content(socket)
         for command in load:
             result = tmux(socket, *command)
             assert result.returncode == 0 and result.stderr == "", result.stderr
         values = {name: tmux(socket, "show-options", "-gv", name).stdout.strip() for name in EXPECTED}
-        values["__status-left__"] = tmux(socket, "show-options", "-gv", "status-left").stdout
-        values["__default-status-left__"] = defaults["status-left"]
+        values["__content__"] = content(socket)
+        values["__default-content__"] = defaults
         return values
     finally:
         tmux(socket, "kill-server")
@@ -75,7 +87,7 @@ def test_tpm_entry_point_matches_source_file():
 @pytestmark_tmux
 def test_does_not_replace_status_contents():
     values = options_after(("source-file", str(REPO / "deepwick.conf")))
-    assert values["__status-left__"] == values["__default-status-left__"]
+    assert values["__content__"] == values["__default-content__"]
 
 
 def test_tpm_entry_point_is_executable():
