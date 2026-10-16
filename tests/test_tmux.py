@@ -69,7 +69,7 @@ def options_after(*load):
     finally:
         tmux(socket, "kill-server")
         # tmux never unlinks its socket on exit.
-        (Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / socket).unlink(missing_ok=True)
+        (Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / socket).unlink(missing_ok=True)
 
 
 @pytestmark_tmux
