@@ -1,8 +1,11 @@
 import contextlib
 import itertools
 import os
+import re
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ from deepwick_spec.check_port import check_port
 from deepwick_spec.palette import load_palette
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 PALETTE = load_palette()
 C = PALETTE.colors
 _ids = itertools.count()
@@ -115,3 +119,146 @@ def test_tpm_entry_point_is_executable():
 
 def test_port_conventions():
     assert check_port(REPO, PALETTE.allowed_hex()) == []
+
+
+LAYOUTS = {"powerline": "deepwick-status.conf", "plain": "deepwick-status-plain.conf"}
+FORMATS = ("status-left", "status-right", "window-status-format", "window-status-current-format")
+POWERLINE_GLYPHS = {"\ue0b0", "\ue0b1", "\ue0b2", "\ue0b3"}
+STYLE = re.compile(r"#\[([^\]]*)\]")
+
+
+def themed(layout):
+    return options_after(("source-file", str(REPO / "deepwick.conf")), ("source-file", str(REPO / LAYOUTS[layout])))
+
+
+def expand(socket, name, target=":0"):
+    return tmux(socket, "display-message", "-p", "-t", target, f"#{{T:{name}}}").stdout.rstrip("\n")
+
+
+def formats(layout):
+    """Each format as tmux renders it for window 0, the current window, with no alerts."""
+    with server() as socket:
+        tmux(socket, "source-file", str(REPO / "deepwick.conf"))
+        tmux(socket, "source-file", str(REPO / LAYOUTS[layout]))
+        return {name: expand(socket, name) for name in FORMATS}
+
+
+def label_style(rendered, index):
+    return next(style_dict(style) for style, text in segments(rendered) if text.startswith(f"{index} "))
+
+
+def segments(value):
+    """(style, text) pairs: each #[...] block and the literal text up to the next one."""
+    parts = STYLE.split(value)
+    return list(zip(parts[1::2], parts[2::2]))
+
+
+def style_dict(style):
+    return dict(item.partition("=")[::2] for item in style.split(","))
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_committed_layout_matches_generator(layout):
+    import generate
+    assert (REPO / LAYOUTS[layout]).read_text(encoding="utf-8") == generate.render(PALETTE, layout)
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_layout_replaces_status_contents(layout):
+    values = themed(layout)
+    content, defaults = values["__content__"], values["__default-content__"]
+    for name in FORMATS:
+        assert content[name] != defaults[name], name
+    assert content["window-status-separator"] == "\n"
+    assert content["status-justify"] == "left\n"
+    # Room for the date, time and a fully qualified host name.
+    assert content["status-right-length"] == "60\n"
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_layout_keeps_deepwick_styles(layout):
+    values = themed(layout)
+    for name, expected in EXPECTED.items():
+        assert values[name].lower() == expected.lower(), name
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_layout_colors_are_palette_colors(layout):
+    allowed = {value.lower() for value in C.values()}
+    for name, value in formats(layout).items():
+        styles = [style_dict(style) for style, _ in segments(value)]
+        assert styles, name
+        for style in styles:
+            assert style["fg"] in allowed and style["bg"] in allowed, (name, style)
+
+
+@pytestmark_tmux
+def test_powerline_layout_uses_powerline_separators():
+    used = set()
+    for name, value in formats("powerline").items():
+        for style, text in segments(value):
+            glyphs = {ch for ch in text if not ch.isascii()}
+            assert glyphs <= POWERLINE_GLYPHS, (name, text)
+            if glyphs:
+                # Glyphs mustn't pick up bold from the *-style options.
+                assert {"nobold", "noitalics", "nounderscore"} <= set(style.split(",")), (name, style)
+            used |= glyphs
+    assert used == POWERLINE_GLYPHS
+
+
+@pytestmark_tmux
+def test_plain_layout_needs_no_patched_font():
+    for name, value in formats("plain").items():
+        assert value.isascii(), name
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_tab_colors(layout):
+    values = formats(layout)
+    assert label_style(values["window-status-format"], 0) == {"fg": C["muted"].lower(), "bg": C["overlay"].lower()}
+    assert label_style(values["window-status-current-format"], 0) == {
+        "fg": C["background"].lower(), "bg": C["teal"].lower()}
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_tpm_option_loads_layout(layout):
+    via_tpm = options_after(("set-option", "-g", "@deepwick_status", layout), ("run-shell", str(REPO / "deepwick.tmux")))
+    assert via_tpm == themed(layout)
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("value", ["", "bogus"])
+def test_tpm_option_other_values_leave_contents(value):
+    values = options_after(("set-option", "-g", "@deepwick_status", value), ("run-shell", str(REPO / "deepwick.tmux")))
+    assert values["__content__"] == values["__default-content__"]
+
+
+ALERTS = {
+    "activity": ("echo hi", "window_activity_flag", {"fg": C["yellow"].lower(), "bg": C["overlay"].lower()}),
+    "bell": ("printf '\\a'", "window_bell_flag", {"fg": C["red"].lower(), "bg": C["overlay"].lower(), "bold": ""}),
+}
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("alert", ALERTS)
+def test_inactive_tab_shows_alerts(layout, alert):
+    command, flag, expected = ALERTS[alert]
+    with server() as socket:
+        tmux(socket, "source-file", str(REPO / "deepwick.conf"))
+        tmux(socket, "source-file", str(REPO / LAYOUTS[layout]))
+        tmux(socket, "set-option", "-g", "monitor-activity", "on")
+        tmux(socket, "new-window", "-d", "-n", "alerting", "--", "sh", "-c", f"sleep 0.3; {command}; exec sleep 30")
+        deadline = time.monotonic() + 5
+        while expand(socket, f"{flag}", ":1") != "1":
+            assert time.monotonic() < deadline, f"{flag} never set"
+            time.sleep(0.05)
+        rendered = expand(socket, "window-status-format", ":1")
+        assert label_style(rendered, 1) == expected
+        name_style = next(style_dict(style) for style, text in segments(rendered) if text.startswith("alerting "))
+        assert name_style == expected
