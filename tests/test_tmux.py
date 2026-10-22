@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 import os
 import shutil
@@ -54,10 +55,20 @@ def content(socket):
     return {name: tmux(socket, "show-options", flags, name).stdout for name, flags in CONTENT_OPTIONS.items()}
 
 
-def options_after(*load):
+@contextlib.contextmanager
+def server():
     socket = f"deepwick-test-{os.getpid()}-{next(_ids)}"
     try:
         assert tmux(socket, "-f", "/dev/null", "new-session", "-d").returncode == 0
+        yield socket
+    finally:
+        tmux(socket, "kill-server")
+        # tmux never unlinks its socket on exit.
+        (Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / socket).unlink(missing_ok=True)
+
+
+def options_after(*load):
+    with server() as socket:
         defaults = content(socket)
         for command in load:
             result = tmux(socket, *command)
@@ -66,10 +77,6 @@ def options_after(*load):
         values["__content__"] = content(socket)
         values["__default-content__"] = defaults
         return values
-    finally:
-        tmux(socket, "kill-server")
-        # tmux never unlinks its socket on exit.
-        (Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / socket).unlink(missing_ok=True)
 
 
 @pytestmark_tmux
@@ -77,6 +84,16 @@ def test_source_file_sets_every_style():
     values = options_after(("source-file", str(REPO / "deepwick.conf")))
     for name, expected in EXPECTED.items():
         assert values[name].lower() == expected.lower(), name
+
+
+@pytestmark_tmux
+def test_styles_survive_format_expansion():
+    # tmux 3.6+ selection and position styles default to #{E:mode-style}, and #D/#F are format aliases.
+    with server() as socket:
+        tmux(socket, "source-file", str(REPO / "deepwick.conf"))
+        for name in EXPECTED:
+            raw = tmux(socket, "show-options", "-gv", name).stdout.strip()
+            assert tmux(socket, "display-message", "-p", f"#{{E:{name}}}").stdout.strip() == raw, name
 
 
 @pytestmark_tmux
